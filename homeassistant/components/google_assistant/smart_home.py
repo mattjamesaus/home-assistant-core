@@ -186,22 +186,55 @@ async def async_devices_query_response(hass, config, payload_devices):
     return {"devices": devices}
 
 
-async def _entity_execute(entity, data, executions):
+async def _entity_execute(
+    entity: GoogleEntity, data: RequestData, executions: list[dict[str, Any]]
+) -> dict[str, Any] | None:
     """Execute all commands for an entity.
 
     Returns a dict if a special result needs to be set.
     """
+    confirmed = True
     for execution in executions:
         try:
-            await entity.execute(data, execution)
+            if await entity.execute(data, execution) is False:
+                confirmed = False
         except SmartHomeError as err:
             return {
                 "ids": [entity.entity_id],
                 "status": "ERROR",
                 **err.to_response(),
             }
+        except Exception:
+            _LOGGER.exception(
+                "Unexpected error executing command for %s", entity.entity_id
+            )
+            return {
+                "ids": [entity.entity_id],
+                "status": "ERROR",
+                "errorCode": ERR_UNKNOWN_ERROR,
+            }
 
+    if not confirmed:
+        return {"ids": [entity.entity_id], "status": "PENDING"}
     return None
+
+
+async def _async_report_pending_execution(
+    hass: HomeAssistant,
+    data: RequestData,
+    entity: GoogleEntity,
+    task: asyncio.Task[dict[str, Any] | None],
+) -> None:
+    """Report the final state even if a pending command did not change it."""
+    await asyncio.wait([task])
+    if task.cancelled() or task.exception() is not None:
+        return
+    if hass.states.get(entity.entity_id) is None:
+        return
+    entity.async_update()
+    await data.config.async_report_state_all(
+        {"devices": {"states": {entity.entity_id: entity.query_serialize()}}}
+    )
 
 
 @HANDLERS.register("action.devices.EXECUTE")
@@ -250,27 +283,31 @@ async def handle_devices_execute(
             entities[entity_id] = GoogleEntity(hass, data.config, state)
             executions[entity_id] = [execution]
 
-    try:
-        execute_results = await asyncio.wait_for(
-            asyncio.shield(
-                asyncio.gather(
-                    *(
-                        _entity_execute(entities[entity_id], data, execution)
-                        for entity_id, execution in executions.items()
-                    )
-                )
-            ),
-            EXECUTE_LIMIT,
+    tasks = {
+        entity_id: hass.async_create_task(
+            _entity_execute(entities[entity_id], data, execution),
+            f"Google Assistant execute {entity_id}",
         )
-        results.update(
-            {
-                entity_id: result
-                for entity_id, result in zip(executions, execute_results, strict=False)
-                if result is not None
-            }
-        )
-    except TimeoutError:
-        pass
+        for entity_id, execution in executions.items()
+    }
+    if tasks:
+        await asyncio.wait(tasks.values(), timeout=EXECUTE_LIMIT)
+
+    for entity_id, task in tasks.items():
+        if not task.done():
+            # Keep executing once; later state changes use the existing reporter.
+            results[entity_id] = {"ids": [entity_id], "status": "PENDING"}
+        elif (result := task.result()) is not None:
+            results[entity_id] = result
+        if (
+            entity_id in results
+            and results[entity_id]["status"] == "PENDING"
+            and data.config.should_report_state
+        ):
+            hass.async_create_task(
+                _async_report_pending_execution(hass, data, entities[entity_id], task),
+                f"Google Assistant report pending execution {entity_id}",
+            )
 
     final_results = list(results.values())
 
