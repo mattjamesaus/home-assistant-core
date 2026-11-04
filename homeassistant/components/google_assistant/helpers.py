@@ -1,6 +1,7 @@
 """Helper classes for Google Assistant integration."""
 
 from abc import ABC, abstractmethod
+import asyncio
 from asyncio import gather
 from collections.abc import Callable, Collection, Mapping
 from datetime import datetime, timedelta
@@ -15,8 +16,21 @@ from awesomeversion import AwesomeVersion
 from yarl import URL
 
 from homeassistant.components import webhook
-from homeassistant.const import CONF_NAME, STATE_UNAVAILABLE, EntityStateAttribute
-from homeassistant.core import CALLBACK_TYPE, Context, HomeAssistant, State, callback
+from homeassistant.const import (
+    CONF_NAME,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    EntityStateAttribute,
+)
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Context,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+)
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
@@ -24,7 +38,7 @@ from homeassistant.helpers import (
     intent,
     start,
 )
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.network import get_url
 from homeassistant.helpers.redact import partial_redact
 from homeassistant.util.dt import utcnow
@@ -43,6 +57,7 @@ from .const import (
 from .data_redaction import async_redact_msg
 from .error import SmartHomeError
 
+STATE_CONFIRMATION_TIMEOUT = 2
 SYNC_DELAY = 15
 _LOGGER = logging.getLogger(__name__)
 LOCAL_SDK_VERSION_HEADER = "HA-Cloud-Version"
@@ -708,18 +723,24 @@ class GoogleEntity:
         """Serialize entity for a REACHABLE_DEVICE response."""
         return {"verificationId": self.entity_id}
 
-    async def execute(self, data, command_payload):
+    async def execute(self, data: RequestData, command_payload: dict[str, Any]) -> bool:
         """Execute a command.
 
         https://developers.google.com/actions/smarthome/create-app#actiondevicesexecute
         """
+        self.async_update()
         command = command_payload["command"]
         params = command_payload.get("params", {})
         challenge = command_payload.get("challenge", {})
         executed = False
         for trt in self.traits():
             if trt.can_execute(command, params):
+                expected = trt.response_state(command, params)
                 await trt.execute(command, data, params, challenge)
+                if expected is not None and not self.state.attributes.get(
+                    EntityStateAttribute.ASSUMED_STATE
+                ):
+                    return await self._async_confirm_state(expected)
                 executed = True
                 break
 
@@ -728,6 +749,36 @@ class GoogleEntity:
                 ERR_FUNCTION_NOT_SUPPORTED,
                 f"Unable to execute {command} for {self.entity_id}",
             )
+
+        return True
+
+    async def _async_confirm_state(self, expected: dict[str, Any]) -> bool:
+        """Wait briefly for delayed device feedback without guessing a new state."""
+        confirmed = asyncio.Event()
+
+        @callback
+        def check_state(_event: Event[EventStateChangedData] | None = None) -> None:
+            if self.hass.states.get(self.entity_id) is None:
+                return
+            self.async_update()
+            if self.state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                return
+            current = self.query_serialize()
+            if current.get("online") and all(
+                current.get(key) == value for key, value in expected.items()
+            ):
+                confirmed.set()
+
+        unsub = async_track_state_change_event(self.hass, self.entity_id, check_state)
+        try:
+            check_state()
+            async with asyncio.timeout(STATE_CONFIRMATION_TIMEOUT):
+                await confirmed.wait()
+        except TimeoutError:
+            return False
+        finally:
+            unsub()
+        return True
 
     @callback
     def async_update(self):

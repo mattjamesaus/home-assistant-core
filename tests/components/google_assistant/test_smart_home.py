@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import ANY, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pytest_homeassistant.common import (
@@ -35,6 +35,7 @@ from homeassistant.components.google_assistant.const import (
     EVENT_QUERY_RECEIVED,
     EVENT_SYNC_RECEIVED,
 )
+from homeassistant.components.google_assistant.error import SmartHomeError
 from homeassistant.const import (
     ATTR_UNIT_OF_MEASUREMENT,
     EVENT_CALL_SERVICE,
@@ -42,8 +43,9 @@ from homeassistant.const import (
     UnitOfTemperature,
     __version__,
 )
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, ServiceCall, State
 from homeassistant.core_config import async_process_ha_core_config
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
@@ -516,7 +518,7 @@ async def test_query_message(hass: HomeAssistant) -> None:
 
 @pytest.mark.parametrize(
     ("report_state", "on", "brightness", "value"),
-    [(False, True, 20, 0.2), (True, ANY, ANY, ANY)],
+    [(False, True, 20, 0.2), (True, True, 20, 0.2)],
 )
 async def test_execute(
     hass: HomeAssistant, light_only, report_state, on, brightness, value
@@ -664,11 +666,9 @@ async def test_execute(
     assert service_events[3].context == events[0].context
 
 
-@pytest.mark.parametrize(
-    ("report_state", "on", "brightness", "value"), [(False, False, ANY, ANY)]
-)
+@pytest.mark.parametrize("report_state", [False, True])
 async def test_execute_times_out(
-    hass: HomeAssistant, light_only, report_state, on, brightness, value
+    hass: HomeAssistant, light_only, report_state: bool
 ) -> None:
     """Test an execute command which times out."""
     orig_execute_limit = sh.EXECUTE_LIMIT
@@ -747,30 +747,8 @@ async def test_execute_times_out(
                     "status": "ERROR",
                     "errorCode": "deviceOffline",
                 },
-                {
-                    "ids": ["light.ceiling_lights"],
-                    "status": "SUCCESS",
-                    "states": {
-                        "on": on,
-                        "online": True,
-                    },
-                },
-                {
-                    "ids": ["light.kitchen_lights"],
-                    "status": "SUCCESS",
-                    "states": {
-                        "on": True,
-                        "online": True,
-                        "brightness": brightness,
-                        "color": {
-                            "spectrumHsv": {
-                                "hue": 345,
-                                "saturation": 0.75,
-                                "value": value,
-                            },
-                        },
-                    },
-                },
+                {"ids": ["light.ceiling_lights"], "status": "PENDING"},
+                {"ids": ["light.kitchen_lights"], "status": "PENDING"},
             ]
         },
     }
@@ -1639,3 +1617,478 @@ async def test_proxy_selected(
         "requestId": REQ_ID,
         "payload": {},
     }
+
+
+@pytest.mark.parametrize("source", [const.SOURCE_CLOUD, const.SOURCE_LOCAL])
+@pytest.mark.parametrize("report_state", [False, True])
+@pytest.mark.parametrize(
+    (
+        "entity_id",
+        "initial",
+        "attributes",
+        "service",
+        "command",
+        "params",
+        "updated",
+        "updated_attributes",
+        "expected",
+    ),
+    [
+        pytest.param(
+            "light.test",
+            "off",
+            {},
+            "turn_on",
+            trait.COMMAND_ON_OFF,
+            {"on": True},
+            "on",
+            {},
+            {"on": True},
+            id="power-on",
+        ),
+        pytest.param(
+            "light.test",
+            "on",
+            {},
+            "turn_off",
+            trait.COMMAND_ON_OFF,
+            {"on": False},
+            "off",
+            {},
+            {"on": False},
+            id="power-off",
+        ),
+        pytest.param(
+            "light.test",
+            "on",
+            {
+                "supported_color_modes": ["brightness"],
+                "color_mode": "brightness",
+                "brightness": 25,
+            },
+            "turn_on",
+            trait.COMMAND_BRIGHTNESS_ABSOLUTE,
+            {"brightness": 50},
+            "on",
+            {
+                "supported_color_modes": ["brightness"],
+                "color_mode": "brightness",
+                "brightness": 128,
+            },
+            {"brightness": 50},
+            id="brightness",
+        ),
+        pytest.param(
+            "media_player.test",
+            "on",
+            {"supported_features": 4, "volume_level": 0.2},
+            "volume_set",
+            trait.COMMAND_SET_VOLUME,
+            {"volumeLevel": 70},
+            "on",
+            {"supported_features": 4, "volume_level": 0.7},
+            {"currentVolume": 70},
+            id="volume",
+        ),
+        pytest.param(
+            "media_player.test",
+            "on",
+            {
+                "supported_features": 2048,
+                "source_list": ["HDMI 1", "HDMI 2"],
+                "source": "HDMI 1",
+            },
+            "select_source",
+            trait.COMMAND_SET_INPUT,
+            {"newInput": "HDMI 2"},
+            "on",
+            {
+                "supported_features": 2048,
+                "source_list": ["HDMI 1", "HDMI 2"],
+                "source": "HDMI 2",
+            },
+            {"currentInput": "HDMI 2"},
+            id="input",
+        ),
+    ],
+)
+async def test_execute_waits_for_device_feedback(
+    hass: HomeAssistant,
+    source: str,
+    report_state: bool,
+    entity_id: str,
+    initial: str,
+    attributes: dict,
+    service: str,
+    command: str,
+    params: dict,
+    updated: str,
+    updated_attributes: dict,
+    expected: dict,
+) -> None:
+    """Do not reply with the old state when feedback follows service completion."""
+    hass.states.async_set(entity_id, initial, attributes)
+    dispatched = asyncio.Event()
+    calls = []
+
+    async def handle_service(call: ServiceCall) -> None:
+        calls.append(call)
+        dispatched.set()
+
+    hass.services.async_register(
+        entity_id.split(".", maxsplit=1)[0], service, handle_service
+    )
+    request = {
+        "requestId": REQ_ID,
+        "inputs": [
+            {
+                "intent": "action.devices.EXECUTE",
+                "payload": {
+                    "commands": [
+                        {
+                            "devices": [{"id": entity_id}],
+                            "execution": [{"command": command, "params": params}],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    response = asyncio.create_task(
+        sh.async_handle_message(
+            hass,
+            MockConfig(should_report_state=report_state),
+            None,
+            None,
+            request,
+            source,
+        )
+    )
+    await dispatched.wait()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not response.done()
+    hass.states.async_set(entity_id, updated, updated_attributes)
+    result = await response
+    assert len(calls) == 1
+    [device] = result["payload"]["commands"]
+    assert device["status"] == "SUCCESS"
+    assert device["states"].items() >= expected.items()
+
+
+@pytest.mark.parametrize("source", [const.SOURCE_CLOUD, const.SOURCE_LOCAL])
+@pytest.mark.parametrize(
+    ("error", "error_code"),
+    [
+        (SmartHomeError("deviceOffline", "Test failure"), "deviceOffline"),
+        (HomeAssistantError("Test failure"), "unknownError"),
+    ],
+)
+async def test_execute_preserves_completed_results_at_timeout(
+    hass: HomeAssistant, source: str, error: Exception, error_code: str
+) -> None:
+    """A slow device must not discard another device's success or error."""
+    hass.states.async_set("light.slow", "off")
+    hass.states.async_set("light.fast", "off")
+    hass.states.async_set("light.failed", "off")
+    release = asyncio.Event()
+    calls = []
+
+    async def handle_service(call: ServiceCall) -> None:
+        entity_id = call.data["entity_id"]
+        calls.append(entity_id)
+        if entity_id == "light.failed":
+            raise error
+        if entity_id == "light.slow":
+            await release.wait()
+        hass.states.async_set(entity_id, "on")
+
+    hass.services.async_register("light", "turn_on", handle_service)
+    request = {
+        "requestId": REQ_ID,
+        "inputs": [
+            {
+                "intent": "action.devices.EXECUTE",
+                "payload": {
+                    "commands": [
+                        {
+                            "devices": [
+                                {"id": entity_id}
+                                for entity_id in (
+                                    "light.slow",
+                                    "light.fast",
+                                    "light.failed",
+                                )
+                            ],
+                            "execution": [
+                                {
+                                    "command": trait.COMMAND_ON_OFF,
+                                    "params": {"on": True},
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    with patch.object(sh, "EXECUTE_LIMIT", 0.02):
+        result = await sh.async_handle_message(
+            hass, MockConfig(should_report_state=True), None, None, request, source
+        )
+    assert result["payload"]["commands"] == unordered(
+        [
+            {"ids": ["light.slow"], "status": "PENDING"},
+            {
+                "ids": ["light.fast"],
+                "status": "SUCCESS",
+                "states": {"online": True, "on": True},
+            },
+            {"ids": ["light.failed"], "status": "ERROR", "errorCode": error_code},
+        ]
+    )
+    release.set()
+    await hass.async_block_till_done()
+    assert hass.states.get("light.slow").state == "on"
+    assert sorted(calls) == ["light.failed", "light.fast", "light.slow"]
+
+
+@pytest.mark.parametrize("source", [const.SOURCE_CLOUD, const.SOURCE_LOCAL])
+@pytest.mark.parametrize("report_state", [False, True])
+@pytest.mark.parametrize("terminal_on", [False, True])
+async def test_execute_reports_pending_completion(
+    hass: HomeAssistant, source: str, report_state: bool, terminal_on: bool
+) -> None:
+    """Keep a slow command running once and report its eventual result."""
+    hass.states.async_set("light.test", "off")
+    release = asyncio.Event()
+    calls = []
+
+    async def handle_service(call: ServiceCall) -> None:
+        calls.append(call)
+        await release.wait()
+        hass.states.async_set("light.test", "on" if terminal_on else "off")
+
+    hass.services.async_register("light", "turn_on", handle_service)
+    config = MockConfig(should_report_state=report_state)
+    request = {
+        "requestId": REQ_ID,
+        "inputs": [
+            {
+                "intent": "action.devices.EXECUTE",
+                "payload": {
+                    "commands": [
+                        {
+                            "devices": [{"id": "light.test"}],
+                            "execution": [
+                                {
+                                    "command": trait.COMMAND_ON_OFF,
+                                    "params": {"on": True},
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    with (
+        patch.object(
+            config, "async_report_state_all", new_callable=AsyncMock
+        ) as report,
+        patch.object(sh, "EXECUTE_LIMIT", 0.02),
+        patch(
+            "homeassistant.components.google_assistant.helpers.STATE_CONFIRMATION_TIMEOUT",
+            0.03,
+        ),
+    ):
+        result = await sh.async_handle_message(
+            hass, config, None, None, request, source
+        )
+        assert result["payload"]["commands"] == [
+            {"ids": ["light.test"], "status": "PENDING"}
+        ]
+        report.assert_not_awaited()
+        release.set()
+        await hass.async_block_till_done()
+        assert len(calls) == 1
+        assert report.await_count == report_state
+        assert all(
+            call.args
+            == (
+                {
+                    "devices": {
+                        "states": {"light.test": {"online": True, "on": terminal_on}}
+                    }
+                },
+            )
+            for call in report.await_args_list
+        )
+
+
+@pytest.mark.parametrize("initial", ["on", "unknown", "unavailable"])
+async def test_execute_unconfirmed_feedback_keeps_remaining_commands(
+    hass: HomeAssistant, initial: str
+) -> None:
+    """Unrelated or absent feedback must not confirm power or drop later commands."""
+    hass.states.async_set(
+        "light.test",
+        initial,
+        {
+            "supported_color_modes": ["brightness"],
+            "color_mode": "brightness",
+            "brightness": 25,
+        },
+    )
+    calls = []
+
+    async def handle_service(call: ServiceCall) -> None:
+        calls.append(call.service)
+        hass.states.async_set(
+            "light.test",
+            initial,
+            {
+                "supported_color_modes": ["brightness"],
+                "color_mode": "brightness",
+                "brightness": 128,
+            },
+        )
+
+    hass.services.async_register("light", "turn_off", handle_service)
+    hass.services.async_register("light", "turn_on", handle_service)
+    request = {
+        "requestId": REQ_ID,
+        "inputs": [
+            {
+                "intent": "action.devices.EXECUTE",
+                "payload": {
+                    "commands": [
+                        {
+                            "devices": [{"id": "light.test"}],
+                            "execution": [
+                                {
+                                    "command": trait.COMMAND_ON_OFF,
+                                    "params": {"on": False},
+                                },
+                                {
+                                    "command": trait.COMMAND_BRIGHTNESS_ABSOLUTE,
+                                    "params": {"brightness": 50},
+                                },
+                            ],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    with patch(
+        "homeassistant.components.google_assistant.helpers.STATE_CONFIRMATION_TIMEOUT",
+        0.01,
+    ):
+        result = await sh.async_handle_message(
+            hass, MockConfig(), None, None, request, const.SOURCE_CLOUD
+        )
+    assert result["payload"]["commands"] == [
+        {"ids": ["light.test"], "status": "PENDING"}
+    ]
+    assert calls == ["turn_off", "turn_on"]
+
+
+@pytest.mark.parametrize("on", [False, True])
+async def test_execute_already_at_requested_state(
+    hass: HomeAssistant, on: bool
+) -> None:
+    """An idempotent command does not need a new state event."""
+    hass.states.async_set("light.test", "on" if on else "off")
+    hass.services.async_register("light", "turn_on", AsyncMock())
+    hass.services.async_register("light", "turn_off", AsyncMock())
+    request = {
+        "requestId": REQ_ID,
+        "inputs": [
+            {
+                "intent": "action.devices.EXECUTE",
+                "payload": {
+                    "commands": [
+                        {
+                            "devices": [{"id": "light.test"}],
+                            "execution": [
+                                {"command": trait.COMMAND_ON_OFF, "params": {"on": on}}
+                            ],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    result = await sh.async_handle_message(
+        hass,
+        MockConfig(should_report_state=True),
+        None,
+        None,
+        request,
+        const.SOURCE_LOCAL,
+    )
+    assert result["payload"]["commands"] == [
+        {
+            "ids": ["light.test"],
+            "status": "SUCCESS",
+            "states": {"online": True, "on": on},
+        }
+    ]
+
+
+async def test_execute_request_cancellation_keeps_device_command(
+    hass: HomeAssistant,
+) -> None:
+    """A disconnected caller must not cancel or repeat an in-flight command."""
+    hass.states.async_set("light.test", "off")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def handle_service(call: ServiceCall) -> None:
+        calls.append(call)
+        started.set()
+        await release.wait()
+        hass.states.async_set("light.test", "on")
+
+    hass.services.async_register("light", "turn_on", handle_service)
+    request = {
+        "requestId": REQ_ID,
+        "inputs": [
+            {
+                "intent": "action.devices.EXECUTE",
+                "payload": {
+                    "commands": [
+                        {
+                            "devices": [{"id": "light.test"}],
+                            "execution": [
+                                {
+                                    "command": trait.COMMAND_ON_OFF,
+                                    "params": {"on": True},
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    response = asyncio.create_task(
+        sh.async_handle_message(
+            hass,
+            MockConfig(should_report_state=True),
+            None,
+            None,
+            request,
+            const.SOURCE_LOCAL,
+        )
+    )
+    await started.wait()
+    response.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+    release.set()
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+    assert hass.states.get("light.test").state == "on"
