@@ -1,0 +1,25 @@
+{
+  "core_version": "2026.10.0",
+  "base_source_commit": "6a811d3359c7b2076dc9e1cf900843a129c044af",
+  "upstream_patch_commit": "8c308d887225f99be0475b93f62b3bf62144e88d",
+  "base_image": "ghcr.io/home-assistant/raspberrypi4-64-homeassistant:2026.10.0@sha256:81a67e6f54171961402ed2964d17b2a929ab669b759efad61688b81a8dcd102d",
+  "platform": "linux/arm64",
+  "modules": [
+    {
+      "path": "homeassistant/components/google_assistant/helpers.py",
+      "before_sha256": "0767dce4ad56ca1999ec6cec030ea9e46e683db82c664d1c8f3e03130586838b",
+      "after_sha256": "ca0a7ec8e923d79bc7c5b5c2cf553b05f0656f6590c9e753e199094485f9c226"
+    },
+    {
+      "path": "homeassistant/components/google_assistant/smart_home.py",
+      "before_sha256": "b2e2657dfb7f6e2bcee0ee8d6526ffc71a5e8c2a1fc071853bd53627478ca4c3",
+      "after_sha256": "76a9377b869ec26c348bb73e29f49d6f6a5c053c634f6e99eeda76b3fc928f9b"
+    },
+    {
+      "path": "homeassistant/components/google_assistant/trait.py",
+      "before_sha256": "1bb62ac0056d6cb4eee0e78cb9ec4074bdad3e80ff0da5d7b5446f02030ce2da",
+      "after_sha256": "06e6691ff89f7e5a98a42771277644719ead8de0861dd5281f1addb27d303cb8"
+    }
+  ],
+  "patch_sha256": "2efe2b463356d021e74a741bd981866e28242f61d9997613fb53f2d7162e4384"
+}

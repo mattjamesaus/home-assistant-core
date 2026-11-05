@@ -1,0 +1,70 @@
+name: Google EXECUTE trial image
+
+on:
+  push:
+    branches:
+      - codex/google-execute-trial-image-20261105
+    paths:
+      - .github/workflows/google-execute-trial-image.yml
+      - trial-image/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: google-execute-trial-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'mattjamesaus/home-assistant-core'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      TRIAL_IMAGE: ghcr.io/mattjamesaus/ha-google-execute-test:2026.10.0
+    steps:
+      - name: Check out public trial sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build pinned ARM64 image
+        run: >-
+          docker build --platform linux/arm64
+          --label org.opencontainers.image.source=https://github.com/mattjamesaus/home-assistant-core
+          --label org.opencontainers.image.revision=${{ github.sha }}
+          --tag "$TRIAL_IMAGE" trial-image
+
+      - name: Start with empty config and no network
+        run: docker run --detach --name trial-smoke --network none "$TRIAL_IMAGE"
+
+      - name: Verify startup HTTP endpoint
+        shell: bash
+        run: |
+          for attempt in $(seq 1 60); do
+            if docker exec trial-smoke python3 -c 'import json,urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8123/api/onboarding",timeout=3); assert r.status==200; json.load(r)' >/dev/null 2>&1; then
+              echo "Core startup HTTP check passed with isolated empty configuration"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs --tail 100 trial-smoke
+          exit 1
+
+      - name: Remove only the smoke-test container
+        if: always()
+        run: docker rm --force --volumes trial-smoke || true
+
+      - name: Authenticate to GHCR with the ephemeral workflow token
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+
+      - name: Publish trial image and record digest
+        run: |
+          docker push "$TRIAL_IMAGE"
+          docker image inspect "$TRIAL_IMAGE" --format '{{index .RepoDigests 0}}' | tee image-digest.txt
+          cat image-digest.txt >> "$GITHUB_STEP_SUMMARY"
